@@ -394,7 +394,11 @@ impl PipelineCache {
     #[inline]
     pub fn block_on_render_pipeline(&mut self, id: CachedRenderPipelineId) {
         if self.pipelines.len() <= id.id() {
-            self.process_queue();
+            if self.web {
+                self.take_new_pipelines();
+            } else {
+                self.process_queue();
+            }
         }
 
         if self.web {
@@ -821,20 +825,9 @@ impl PipelineCache {
     ///
     /// [`RenderSystems::Render`]: crate::RenderSystems::Render
     pub fn process_queue(&mut self) {
-        let mut waiting_pipelines = mem::take(&mut self.waiting_pipelines);
+        self.take_new_pipelines();
+        let waiting_pipelines = mem::take(&mut self.waiting_pipelines);
         let mut pipelines = mem::take(&mut self.pipelines);
-
-        {
-            let mut new_pipelines = self
-                .new_pipelines
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for new_pipeline in new_pipelines.drain(..) {
-                let id = pipelines.len();
-                pipelines.push(new_pipeline);
-                waiting_pipelines.insert(id);
-            }
-        }
 
         let mut pace = FramePace::for_frame(self.creation(true), self.web);
         for id in waiting_pipelines {
@@ -842,6 +835,20 @@ impl PipelineCache {
         }
 
         self.pipelines = pipelines;
+    }
+
+    /// Takes the pipelines queued since the last [`Self::process_queue`] into the cache,
+    /// waiting, without starting any.
+    fn take_new_pipelines(&mut self) {
+        let mut new_pipelines = self
+            .new_pipelines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for new_pipeline in new_pipelines.drain(..) {
+            let id = self.pipelines.len();
+            self.pipelines.push(new_pipeline);
+            self.waiting_pipelines.insert(id);
+        }
     }
 
     fn process_pipeline(
@@ -1048,21 +1055,15 @@ fn with_render_pipeline<R>(
         let mut shader_cache = shader_cache.lock().unwrap();
         let mut layout_cache = layout_cache.lock().unwrap();
 
-        let vertex_module = match shader_cache.get(
+        let vertex_module = shader_cache.get(
             id,
             descriptor.vertex.shader.id(),
             &descriptor.vertex.shader_defs,
-        ) {
-            Ok(module) => module,
-            Err(err) => return Err(err),
-        };
+        )?;
 
         let fragment_module = match &descriptor.fragment {
             Some(fragment) => {
-                match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs) {
-                    Ok(module) => Some(module),
-                    Err(err) => return Err(err),
-                }
+                Some(shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs)?)
             }
             None => None,
         };
@@ -1449,6 +1450,19 @@ mod web_tests {
         cache.block_on_render_pipeline(waiting);
 
         assert!(cache.get_render_pipeline(waiting).is_some());
+    }
+
+    #[test]
+    fn on_the_web_blocking_on_a_new_render_pipeline_starts_none_queued_before_it() {
+        let mut cache = cache(true);
+        let earlier = queued(&mut cache, LOADED, 0);
+        let wanted = queued(&mut cache, LOADED, 1);
+
+        cache.block_on_render_pipeline(wanted);
+
+        assert!(cache.get_render_pipeline(wanted).is_some());
+        assert!(is_queued(&cache, earlier));
+        frames_until_made(&mut cache, earlier);
     }
 
     #[test]
