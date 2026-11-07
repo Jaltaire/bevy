@@ -956,11 +956,8 @@ impl PipelineCache {
                 };
             }
 
-            CachedPipelineState::Creating(_) if !pace.may_admit() => {}
-
             CachedPipelineState::Creating(task) => match bevy_tasks::futures::check_ready(task) {
                 Some(Ok(pipeline)) => {
-                    pace.admit();
                     cached_pipeline.state = CachedPipelineState::Ok(pipeline);
                     return;
                 }
@@ -1130,20 +1127,17 @@ enum Creation {
     Task,
 }
 
-/// How many render pipelines one [`PipelineCache::process_queue`] may start creating, and
-/// let into use once made.
+/// How many render pipelines one [`PipelineCache::process_queue`] may start creating.
 ///
-/// On the web, where render pipelines are created as tasks, one of each. Creating a render
-/// pipeline costs the page's main thread translating its shaders, and its first draw costs
-/// the browser's GPU process building its pipeline state, which the page waits for at its next
-/// synchronous call into WebGL. Taken one at a time, however many are asked for at once, a
-/// frame is held up by one pipeline's cost at most, while the shaders of those already
-/// started go on compiling in the background. Elsewhere, every one.
+/// On the web, where render pipelines are created as tasks, one. Starting a render pipeline
+/// costs the page's main thread processing and translating its shaders, and the tasks a
+/// frame starts all run before the page can do anything else. Started one at a time, however
+/// many are asked for at once, a frame is held up by one pipeline's start at most, while the
+/// shaders of those already started go on compiling in the background. Elsewhere, every one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FramePace {
     paced: bool,
     started: bool,
-    admitted: bool,
 }
 
 impl FramePace {
@@ -1153,7 +1147,6 @@ impl FramePace {
         Self {
             paced: web && creation == Creation::Task,
             started: false,
-            admitted: false,
         }
     }
 
@@ -1165,16 +1158,6 @@ impl FramePace {
         }
         self.started = true;
         true
-    }
-
-    /// Whether a render pipeline made in the background may be let into use this frame.
-    fn may_admit(&self) -> bool {
-        !(self.paced && self.admitted)
-    }
-
-    /// Counts a render pipeline let into use this frame.
-    fn admit(&mut self) {
-        self.admitted = true;
     }
 }
 
@@ -1229,41 +1212,26 @@ mod tests {
     use super::{Creation, FramePace};
 
     #[test]
-    fn on_the_web_a_frame_starts_one_render_pipeline_and_lets_one_into_use() {
+    fn on_the_web_a_frame_starts_one_render_pipeline() {
         let mut pace = FramePace::for_frame(Creation::Task, true);
 
         assert!(pace.start());
         assert!(!pace.start());
         assert!(!pace.start());
-        assert!(pace.may_admit());
-        pace.admit();
-        assert!(!pace.may_admit());
     }
 
     #[test]
     fn on_the_web_each_frame_has_its_own_allowance() {
         let mut first = FramePace::for_frame(Creation::Task, true);
         assert!(first.start());
-        first.admit();
+        assert!(!first.start());
 
         let mut next = FramePace::for_frame(Creation::Task, true);
         assert!(next.start());
-        assert!(next.may_admit());
     }
 
     #[test]
-    fn starting_a_pipeline_does_not_use_up_letting_one_into_use_or_the_other_way_round() {
-        let mut started = FramePace::for_frame(Creation::Task, true);
-        assert!(started.start());
-        assert!(started.may_admit());
-
-        let mut admitted = FramePace::for_frame(Creation::Task, true);
-        admitted.admit();
-        assert!(admitted.start());
-    }
-
-    #[test]
-    fn off_the_web_or_creating_within_the_call_every_pipeline_starts_and_is_let_in() {
+    fn off_the_web_or_creating_within_the_call_every_pipeline_starts() {
         for (creation, web) in [
             (Creation::Task, false),
             (Creation::Blocking, true),
@@ -1272,8 +1240,6 @@ mod tests {
             let mut pace = FramePace::for_frame(creation, web);
             for _ in 0..10 {
                 assert!(pace.start(), "{creation:?} on the web: {web}");
-                assert!(pace.may_admit(), "{creation:?} on the web: {web}");
-                pace.admit();
             }
         }
     }
