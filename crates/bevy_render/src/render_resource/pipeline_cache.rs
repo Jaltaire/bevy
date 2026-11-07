@@ -229,6 +229,9 @@ pub struct PipelineCache {
     /// On wasm, this keeps render pipelines from compiling in the background. Otherwise, this
     /// has no effect on macOS or without the `multi_threaded` feature.
     pub(crate) synchronous_pipeline_compilation: bool,
+    /// Whether the cache runs on the web, where only render pipelines are created as tasks,
+    /// through the device's asynchronous pipeline creation, one started a frame.
+    web: bool,
     /// If `true`, the shader cache needs to be repopulated from the main world's `Assets<Shader>`.
     needs_shader_reload: bool,
 }
@@ -284,6 +287,7 @@ impl PipelineCache {
             pipelines: default(),
             global_shader_defs,
             synchronous_pipeline_compilation,
+            web: cfg!(target_arch = "wasm32"),
             needs_shader_reload: true,
         }
     }
@@ -393,8 +397,7 @@ impl PipelineCache {
             self.process_queue();
         }
 
-        #[cfg(target_arch = "wasm32")]
-        {
+        if self.web {
             let cached = &self.pipelines[id.id()];
             if let (
                 CachedPipelineState::Queued | CachedPipelineState::Creating(_),
@@ -553,11 +556,7 @@ impl PipelineCache {
 
     /// How a pipeline the queue reaches is created ([`Creation::of`]).
     fn creation(&self, render: bool) -> Creation {
-        Creation::of(
-            self.synchronous_pipeline_compilation,
-            cfg!(target_arch = "wasm32"),
-            render,
-        )
+        Creation::of(self.synchronous_pipeline_compilation, self.web, render)
     }
 
     fn start_create_render_pipeline(
@@ -577,123 +576,40 @@ impl PipelineCache {
                 bindgroup_layout_cache.get(&self.device, bind_group_layout_descriptor)
             })
             .collect::<SmallVec<[_; BIND_GROUP_LAYOUTS_INLINE_CAPACITY]>>();
+        drop(bindgroup_layout_cache);
+
+        if self.web && creation == Creation::Task {
+            let pending = match with_render_pipeline(
+                &device,
+                &shader_cache,
+                &layout_cache,
+                &bind_group_layout,
+                id,
+                &descriptor,
+                |raw| device.create_render_pipeline_async(raw),
+            ) {
+                Ok(pending) => pending,
+                Err(err) => return CachedPipelineState::Err(err),
+            };
+            return spawn_creation(async move {
+                pending
+                    .await
+                    .map(Pipeline::RenderPipeline)
+                    .map_err(|error| ShaderCacheError::CreatePipeline(error.to_string()))
+            });
+        }
 
         create_pipeline_task(
             async move {
-                let (vertex_module, fragment_module, layout) = {
-                    let mut shader_cache = shader_cache.lock().unwrap();
-                    let mut layout_cache = layout_cache.lock().unwrap();
-
-                    let vertex_module = match shader_cache.get(
-                        id,
-                        descriptor.vertex.shader.id(),
-                        &descriptor.vertex.shader_defs,
-                    ) {
-                        Ok(module) => module,
-                        Err(err) => return Err(err),
-                    };
-
-                    let fragment_module = match &descriptor.fragment {
-                        Some(fragment) => {
-                            match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs)
-                            {
-                                Ok(module) => Some(module),
-                                Err(err) => return Err(err),
-                            }
-                        }
-                        None => None,
-                    };
-
-                    let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
-                        None
-                    } else {
-                        Some(layout_cache.get(
-                            &device,
-                            &bind_group_layout,
-                            descriptor.immediate_size,
-                        ))
-                    };
-
-                    (vertex_module, fragment_module, layout)
-                };
-
-                let vertex_buffer_layouts = descriptor
-                    .vertex
-                    .buffers
-                    .iter()
-                    .map(|layout| {
-                        Some(RawVertexBufferLayout {
-                            array_stride: layout.array_stride,
-                            attributes: &layout.attributes,
-                            step_mode: layout.step_mode,
-                        })
-                    })
-                    .collect::<Vec<_>>();
-
-                let fragment_data = descriptor.fragment.as_ref().map(|fragment| {
-                    (
-                        fragment_module.unwrap(),
-                        fragment.entry_point.as_deref(),
-                        fragment.targets.as_slice(),
-                        fragment
-                            .constants
-                            .iter()
-                            .map(|(k, v)| (k.as_ref(), *v))
-                            .collect::<Vec<_>>(),
-                    )
-                });
-
-                let vertex_constants: Vec<(&str, f64)> = descriptor
-                    .vertex
-                    .constants
-                    .iter()
-                    .map(|(k, v)| (k.as_ref(), *v))
-                    .collect();
-
-                let descriptor = RawRenderPipelineDescriptor {
-                    multiview_mask: None,
-                    depth_stencil: descriptor.depth_stencil.clone(),
-                    label: descriptor.label.as_deref(),
-                    layout: layout.as_ref().map(|layout| -> &PipelineLayout { layout }),
-                    multisample: descriptor.multisample,
-                    primitive: descriptor.primitive,
-                    vertex: RawVertexState {
-                        buffers: &vertex_buffer_layouts,
-                        entry_point: descriptor.vertex.entry_point.as_deref(),
-                        module: &vertex_module,
-                        compilation_options: PipelineCompilationOptions {
-                            constants: &vertex_constants,
-                            zero_initialize_workgroup_memory: descriptor
-                                .zero_initialize_workgroup_memory,
-                        },
-                    },
-                    fragment: fragment_data.as_ref().map(
-                        |(module, entry_point, targets, constants)| RawFragmentState {
-                            entry_point: entry_point.as_deref(),
-                            module,
-                            targets,
-                            compilation_options: PipelineCompilationOptions {
-                                constants,
-                                zero_initialize_workgroup_memory: descriptor
-                                    .zero_initialize_workgroup_memory,
-                            },
-                        },
-                    ),
-                    cache: None,
-                };
-
-                #[cfg(target_arch = "wasm32")]
-                if creation == Creation::Task {
-                    let pending = device.create_render_pipeline_async(&descriptor);
-                    return pending
-                        .await
-                        .map(Pipeline::RenderPipeline)
-                        .map_err(|error| ShaderCacheError::CreatePipeline(error.to_string()));
-                }
-
-                Ok(Pipeline::RenderPipeline(
-                    device.create_render_pipeline(&descriptor),
-                ))
+                with_render_pipeline(
+                    &device,
+                    &shader_cache,
+                    &layout_cache,
+                    &bind_group_layout,
+                    id,
+                    &descriptor,
+                    |raw| Pipeline::RenderPipeline(device.create_render_pipeline(raw)),
+                )
             },
             creation,
         )
@@ -920,7 +836,7 @@ impl PipelineCache {
             }
         }
 
-        let mut pace = FramePace::for_frame(self.creation(true), cfg!(target_arch = "wasm32"));
+        let mut pace = FramePace::for_frame(self.creation(true), self.web);
         for id in waiting_pipelines {
             self.process_pipeline(&mut pipelines[id], id, &mut pace);
         }
@@ -1116,6 +1032,137 @@ fn pipeline_error_context(cached_pipeline: &CachedPipeline) -> String {
     }
 }
 
+/// Hands `create` the render pipeline descriptor `descriptor` becomes with its shaders, from
+/// `shader_cache`, and its layout, from `layout_cache`, and gives what `create` makes, or why
+/// the shaders are not at hand yet.
+fn with_render_pipeline<R>(
+    device: &RenderDevice,
+    shader_cache: &Mutex<ShaderCache<WgpuShaderModule, RenderDevice>>,
+    layout_cache: &Mutex<LayoutCache>,
+    bind_group_layout: &[BindGroupLayout],
+    id: CachedPipelineId,
+    descriptor: &RenderPipelineDescriptor,
+    create: impl FnOnce(&RawRenderPipelineDescriptor) -> R,
+) -> Result<R, ShaderCacheError> {
+    let (vertex_module, fragment_module, layout) = {
+        let mut shader_cache = shader_cache.lock().unwrap();
+        let mut layout_cache = layout_cache.lock().unwrap();
+
+        let vertex_module = match shader_cache.get(
+            id,
+            descriptor.vertex.shader.id(),
+            &descriptor.vertex.shader_defs,
+        ) {
+            Ok(module) => module,
+            Err(err) => return Err(err),
+        };
+
+        let fragment_module = match &descriptor.fragment {
+            Some(fragment) => {
+                match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs) {
+                    Ok(module) => Some(module),
+                    Err(err) => return Err(err),
+                }
+            }
+            None => None,
+        };
+
+        let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
+            None
+        } else {
+            Some(layout_cache.get(device, bind_group_layout, descriptor.immediate_size))
+        };
+
+        (vertex_module, fragment_module, layout)
+    };
+
+    let vertex_buffer_layouts = descriptor
+        .vertex
+        .buffers
+        .iter()
+        .map(|layout| {
+            Some(RawVertexBufferLayout {
+                array_stride: layout.array_stride,
+                attributes: &layout.attributes,
+                step_mode: layout.step_mode,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let fragment_data = descriptor.fragment.as_ref().map(|fragment| {
+        (
+            fragment_module.unwrap(),
+            fragment.entry_point.as_deref(),
+            fragment.targets.as_slice(),
+            fragment
+                .constants
+                .iter()
+                .map(|(k, v)| (k.as_ref(), *v))
+                .collect::<Vec<_>>(),
+        )
+    });
+
+    let vertex_constants: Vec<(&str, f64)> = descriptor
+        .vertex
+        .constants
+        .iter()
+        .map(|(k, v)| (k.as_ref(), *v))
+        .collect();
+
+    let descriptor = RawRenderPipelineDescriptor {
+        multiview_mask: None,
+        depth_stencil: descriptor.depth_stencil.clone(),
+        label: descriptor.label.as_deref(),
+        layout: layout.as_ref().map(|layout| -> &PipelineLayout { layout }),
+        multisample: descriptor.multisample,
+        primitive: descriptor.primitive,
+        vertex: RawVertexState {
+            buffers: &vertex_buffer_layouts,
+            entry_point: descriptor.vertex.entry_point.as_deref(),
+            module: &vertex_module,
+            compilation_options: PipelineCompilationOptions {
+                constants: &vertex_constants,
+                zero_initialize_workgroup_memory: descriptor.zero_initialize_workgroup_memory,
+            },
+        },
+        fragment: fragment_data
+            .as_ref()
+            .map(
+                |(module, entry_point, targets, constants)| RawFragmentState {
+                    entry_point: entry_point.as_deref(),
+                    module,
+                    targets,
+                    compilation_options: PipelineCompilationOptions {
+                        constants,
+                        zero_initialize_workgroup_memory: descriptor
+                            .zero_initialize_workgroup_memory,
+                    },
+                },
+            ),
+        cache: None,
+    };
+
+    Ok(create(&descriptor))
+}
+
+/// Spawns `task`, the rest of a pipeline's creation, on the async compute task pool, where
+/// the cache checks on it each frame. The task is kept behind a lock so that it can be
+/// spawned on a pool that runs tasks on other threads as well as on one that runs them in
+/// place.
+fn spawn_creation(
+    task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
+) -> CachedPipelineState {
+    let task = Mutex::new(Box::pin(task));
+    CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(
+        core::future::poll_fn(move |context| {
+            task.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_mut()
+                .poll(context)
+        }),
+    ))
+}
+
 /// How [`PipelineCache`] creates a pipeline it starts creating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Creation {
@@ -1263,5 +1310,156 @@ mod tests {
     fn on_the_web_only_a_render_pipeline_is_created_as_a_task() {
         assert_eq!(Creation::of(false, true, true), Creation::Task);
         assert_eq!(Creation::of(false, true, false), Creation::Blocking);
+    }
+}
+
+#[cfg(test)]
+mod web_tests {
+    use super::{CachedPipelineState, PipelineCache};
+    use crate::test_utils::create_dummy_device_with;
+    use bevy_asset::{uuid_handle, Handle};
+    use bevy_material::descriptor::{
+        CachedRenderPipelineId, FragmentState, RenderPipelineDescriptor, VertexState,
+    };
+    use bevy_shader::{Shader, ShaderCacheError, ShaderDefVal};
+    use bevy_tasks::{AsyncComputeTaskPool, TaskPool};
+    use wgpu::{ColorTargetState, ColorWrites, TextureFormat};
+
+    const WGSL: &str = "@vertex fn vs() -> @builtin(position) vec4<f32> { return vec4<f32>(0.0); } @fragment fn fs() -> @location(0) vec4<f32> { return vec4<f32>(1.0); }";
+
+    const LOADED: Handle<Shader> = uuid_handle!("0d6f7c3a-5b1e-4e8b-9a2d-1c3e5f7a9b01");
+    const NEVER_LOADED: Handle<Shader> = uuid_handle!("0d6f7c3a-5b1e-4e8b-9a2d-1c3e5f7a9b02");
+
+    fn cache(web: bool) -> PipelineCache {
+        AsyncComputeTaskPool::get_or_init(TaskPool::default);
+        let (device, _queue) = create_dummy_device_with(|_| wgpu::Limits::default());
+        let mut cache = PipelineCache::new(device, false);
+        cache.web = web;
+        cache.set_shader(LOADED.id(), Shader::from_wgsl(WGSL, "web_tests.wgsl"));
+        cache
+    }
+
+    fn descriptor(shader: Handle<Shader>, variant: u32) -> RenderPipelineDescriptor {
+        RenderPipelineDescriptor {
+            label: Some("web test pipeline".into()),
+            vertex: VertexState {
+                shader: shader.clone(),
+                shader_defs: vec![ShaderDefVal::UInt("VARIANT".into(), variant)],
+                entry_point: Some("vs".into()),
+                ..Default::default()
+            },
+            fragment: Some(FragmentState {
+                shader,
+                shader_defs: vec![ShaderDefVal::UInt("VARIANT".into(), variant)],
+                entry_point: Some("fs".into()),
+                targets: vec![Some(ColorTargetState {
+                    format: TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: ColorWrites::ALL,
+                })],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn queued(
+        cache: &mut PipelineCache,
+        shader: Handle<Shader>,
+        variant: u32,
+    ) -> CachedRenderPipelineId {
+        cache.queue_render_pipeline(descriptor(shader, variant))
+    }
+
+    fn is_queued(cache: &PipelineCache, id: CachedRenderPipelineId) -> bool {
+        matches!(
+            cache.get_render_pipeline_state(id),
+            CachedPipelineState::Queued
+        )
+    }
+
+    /// Runs frames until the pipeline `id` is made, and says in how many.
+    fn frames_until_made(cache: &mut PipelineCache, id: CachedRenderPipelineId) -> usize {
+        for frame in 1..=10_000 {
+            cache.process_queue();
+            match cache.get_render_pipeline_state(id) {
+                CachedPipelineState::Ok(_) => return frame,
+                CachedPipelineState::Err(error) => panic!("The pipeline failed: {error}"),
+                CachedPipelineState::Queued | CachedPipelineState::Creating(_) => {}
+            }
+        }
+        panic!("The pipeline was never made.");
+    }
+
+    #[test]
+    fn on_the_web_a_render_pipeline_whose_shader_has_not_loaded_waits_as_an_error_not_as_creating()
+    {
+        let mut cache = cache(true);
+        let id = queued(&mut cache, NEVER_LOADED, 0);
+
+        cache.process_queue();
+
+        assert!(
+            matches!(
+                cache.get_render_pipeline_state(id),
+                CachedPipelineState::Err(ShaderCacheError::ShaderNotLoaded(_))
+            ),
+            "{:?}",
+            cache.get_render_pipeline_state(id)
+        );
+    }
+
+    #[test]
+    fn on_the_web_a_render_pipeline_is_made_through_the_device_s_asynchronous_creation() {
+        let mut cache = cache(true);
+        let id = queued(&mut cache, LOADED, 0);
+
+        frames_until_made(&mut cache, id);
+
+        assert!(cache.get_render_pipeline(id).is_some());
+    }
+
+    #[test]
+    fn on_the_web_one_render_pipeline_starts_a_frame() {
+        let mut cache = cache(true);
+        let ids: Vec<_> = (0..3)
+            .map(|variant| queued(&mut cache, LOADED, variant))
+            .collect();
+
+        cache.process_queue();
+        assert_eq!(ids.iter().filter(|&&id| is_queued(&cache, id)).count(), 2);
+        cache.process_queue();
+        assert_eq!(ids.iter().filter(|&&id| is_queued(&cache, id)).count(), 1);
+        cache.process_queue();
+        assert_eq!(ids.iter().filter(|&&id| is_queued(&cache, id)).count(), 0);
+        for id in ids {
+            frames_until_made(&mut cache, id);
+        }
+    }
+
+    #[test]
+    fn on_the_web_blocking_on_a_render_pipeline_the_pace_held_back_makes_it_within_the_call() {
+        let mut cache = cache(true);
+        let first = queued(&mut cache, LOADED, 0);
+        let held = queued(&mut cache, LOADED, 1);
+        cache.process_queue();
+        let waiting = if is_queued(&cache, held) { held } else { first };
+        assert!(is_queued(&cache, waiting));
+
+        cache.block_on_render_pipeline(waiting);
+
+        assert!(cache.get_render_pipeline(waiting).is_some());
+    }
+
+    #[test]
+    fn off_the_web_every_render_pipeline_starts_in_one_frame() {
+        let mut cache = cache(false);
+        let ids: Vec<_> = (0..3)
+            .map(|variant| queued(&mut cache, LOADED, variant))
+            .collect();
+
+        cache.process_queue();
+
+        assert_eq!(ids.iter().filter(|&&id| is_queued(&cache, id)).count(), 0);
     }
 }

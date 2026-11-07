@@ -207,8 +207,7 @@ impl RenderDevice {
     pub fn create_render_pipeline_async(
         &self,
         desc: &RawRenderPipelineDescriptor,
-    ) -> impl Future<Output = Result<RenderPipeline, wgpu::Error>> + wgpu::WasmNotSend + 'static
-    {
+    ) -> impl Future<Output = Result<RenderPipeline, wgpu::Error>> + wgpu::WasmNotSend + use<> {
         let pending = self.device.create_render_pipeline_async(desc);
         async move { pending.await.map(RenderPipeline::from) }
     }
