@@ -385,8 +385,8 @@ impl PipelineCache {
 
     /// Wait for a render pipeline to finish compiling.
     ///
-    /// On wasm, where nothing can be waited for, a render pipeline still compiling in the
-    /// background is created again within this call instead.
+    /// On wasm, where nothing can be waited for, a render pipeline still waiting to be
+    /// created, or compiling in the background, is created within this call instead.
     #[inline]
     pub fn block_on_render_pipeline(&mut self, id: CachedRenderPipelineId) {
         if self.pipelines.len() <= id.id() {
@@ -397,7 +397,7 @@ impl PipelineCache {
         {
             let cached = &self.pipelines[id.id()];
             if let (
-                CachedPipelineState::Creating(_),
+                CachedPipelineState::Queued | CachedPipelineState::Creating(_),
                 PipelineDescriptor::RenderPipelineDescriptor(descriptor),
             ) = (&cached.state, &cached.descriptor)
             {
@@ -920,16 +920,30 @@ impl PipelineCache {
             }
         }
 
+        let mut pace = FramePace::for_frame(self.creation(true), cfg!(target_arch = "wasm32"));
         for id in waiting_pipelines {
-            self.process_pipeline(&mut pipelines[id], id);
+            self.process_pipeline(&mut pipelines[id], id, &mut pace);
         }
 
         self.pipelines = pipelines;
     }
 
-    fn process_pipeline(&mut self, cached_pipeline: &mut CachedPipeline, id: usize) {
+    fn process_pipeline(
+        &mut self,
+        cached_pipeline: &mut CachedPipeline,
+        id: usize,
+        pace: &mut FramePace,
+    ) {
         match &mut cached_pipeline.state {
             CachedPipelineState::Queued => {
+                let render = matches!(
+                    cached_pipeline.descriptor,
+                    PipelineDescriptor::RenderPipelineDescriptor(_)
+                );
+                if render && !pace.start() {
+                    self.waiting_pipelines.insert(id);
+                    return;
+                }
                 cached_pipeline.state = match &cached_pipeline.descriptor {
                     PipelineDescriptor::RenderPipelineDescriptor(descriptor) => self
                         .start_create_render_pipeline(id, *descriptor.clone(), self.creation(true)),
@@ -942,8 +956,11 @@ impl PipelineCache {
                 };
             }
 
+            CachedPipelineState::Creating(_) if !pace.may_admit() => {}
+
             CachedPipelineState::Creating(task) => match bevy_tasks::futures::check_ready(task) {
                 Some(Ok(pipeline)) => {
+                    pace.admit();
                     cached_pipeline.state = CachedPipelineState::Ok(pipeline);
                     return;
                 }
@@ -1113,6 +1130,54 @@ enum Creation {
     Task,
 }
 
+/// How many render pipelines one [`PipelineCache::process_queue`] may start creating, and
+/// let into use once made.
+///
+/// On the web, where render pipelines are created as tasks, one of each. Creating a render
+/// pipeline costs the page's main thread translating its shaders, and its first draw costs
+/// the browser's GPU process building its pipeline state, which the page waits for at its next
+/// synchronous call into WebGL. Taken one at a time, however many are asked for at once, a
+/// frame is held up by one pipeline's cost at most, while the shaders of those already
+/// started go on compiling in the background. Elsewhere, every one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FramePace {
+    paced: bool,
+    started: bool,
+    admitted: bool,
+}
+
+impl FramePace {
+    /// The pace of one frame for a cache that creates render pipelines as `creation` says,
+    /// on the `web` or not.
+    fn for_frame(creation: Creation, web: bool) -> Self {
+        Self {
+            paced: web && creation == Creation::Task,
+            started: false,
+            admitted: false,
+        }
+    }
+
+    /// Whether another render pipeline may start being created this frame, counting it if
+    /// so.
+    fn start(&mut self) -> bool {
+        if self.paced && self.started {
+            return false;
+        }
+        self.started = true;
+        true
+    }
+
+    /// Whether a render pipeline made in the background may be let into use this frame.
+    fn may_admit(&self) -> bool {
+        !(self.paced && self.admitted)
+    }
+
+    /// Counts a render pipeline let into use this frame.
+    fn admit(&mut self) {
+        self.admitted = true;
+    }
+}
+
 impl Creation {
     /// How a pipeline is created when the cache is asked for `synchronous` compilation or
     /// not, on the `web` or not, and the pipeline is a `render` pipeline or not: on the web,
@@ -1161,7 +1226,57 @@ fn create_pipeline_task(
 
 #[cfg(test)]
 mod tests {
-    use super::Creation;
+    use super::{Creation, FramePace};
+
+    #[test]
+    fn on_the_web_a_frame_starts_one_render_pipeline_and_lets_one_into_use() {
+        let mut pace = FramePace::for_frame(Creation::Task, true);
+
+        assert!(pace.start());
+        assert!(!pace.start());
+        assert!(!pace.start());
+        assert!(pace.may_admit());
+        pace.admit();
+        assert!(!pace.may_admit());
+    }
+
+    #[test]
+    fn on_the_web_each_frame_has_its_own_allowance() {
+        let mut first = FramePace::for_frame(Creation::Task, true);
+        assert!(first.start());
+        first.admit();
+
+        let mut next = FramePace::for_frame(Creation::Task, true);
+        assert!(next.start());
+        assert!(next.may_admit());
+    }
+
+    #[test]
+    fn starting_a_pipeline_does_not_use_up_letting_one_into_use_or_the_other_way_round() {
+        let mut started = FramePace::for_frame(Creation::Task, true);
+        assert!(started.start());
+        assert!(started.may_admit());
+
+        let mut admitted = FramePace::for_frame(Creation::Task, true);
+        admitted.admit();
+        assert!(admitted.start());
+    }
+
+    #[test]
+    fn off_the_web_or_creating_within_the_call_every_pipeline_starts_and_is_let_in() {
+        for (creation, web) in [
+            (Creation::Task, false),
+            (Creation::Blocking, true),
+            (Creation::Blocking, false),
+        ] {
+            let mut pace = FramePace::for_frame(creation, web);
+            for _ in 0..10 {
+                assert!(pace.start(), "{creation:?} on the web: {web}");
+                assert!(pace.may_admit(), "{creation:?} on the web: {web}");
+                pace.admit();
+            }
+        }
+    }
 
     #[test]
     fn synchronous_compilation_creates_every_pipeline_within_the_call() {
