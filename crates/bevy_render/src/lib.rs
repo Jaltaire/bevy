@@ -160,7 +160,8 @@ use std::sync::Mutex;
 pub struct RenderPlugin {
     pub render_creation: RenderCreation,
     /// If `true`, disables asynchronous pipeline compilation.
-    /// This has no effect on macOS, Wasm, iOS, or without the `multi_threaded` feature.
+    /// On Wasm, this keeps render pipelines from compiling in the background. Otherwise, this
+    /// has no effect on macOS, iOS, or without the `multi_threaded` feature.
     pub synchronous_pipeline_compilation: bool,
     /// Debugging flags that can optionally be set when constructing the renderer.
     pub debug_flags: RenderDebugFlags,

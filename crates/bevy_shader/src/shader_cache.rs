@@ -542,6 +542,8 @@ pub enum ShaderCacheError {
     ShaderImportNotYetAvailable,
     #[error("Could not create shader module: {0}")]
     CreateShaderModule(String),
+    #[error("Could not create pipeline: {0}")]
+    CreatePipeline(String),
 }
 
 #[cfg(test)]

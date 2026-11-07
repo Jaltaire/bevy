@@ -197,6 +197,22 @@ impl RenderDevice {
         RenderPipeline::from(wgpu_render_pipeline)
     }
 
+    /// Creates a [`RenderPipeline`] whose shaders the device may go on compiling after this
+    /// returns, resolving once it can be used, or with why it never can.
+    ///
+    /// On WebGL2, its shaders compile and link in the background, and the future resolves
+    /// on the frame whose submission finds them done; the device is not told of a failure,
+    /// which is the future's error alone.
+    #[inline]
+    pub fn create_render_pipeline_async(
+        &self,
+        desc: &RawRenderPipelineDescriptor,
+    ) -> impl Future<Output = Result<RenderPipeline, wgpu::Error>> + wgpu::WasmNotSend + 'static
+    {
+        let pending = self.device.create_render_pipeline_async(desc);
+        async move { pending.await.map(RenderPipeline::from) }
+    }
+
     /// Creates a [`ComputePipeline`].
     #[inline]
     pub fn create_compute_pipeline(

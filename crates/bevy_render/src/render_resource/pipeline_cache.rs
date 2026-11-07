@@ -226,7 +226,8 @@ pub struct PipelineCache {
     new_pipelines: Mutex<Vec<CachedPipeline>>,
     global_shader_defs: Vec<ShaderDefVal>,
     /// If `true`, disables asynchronous pipeline compilation.
-    /// This has no effect on macOS, wasm, or without the `multi_threaded` feature.
+    /// On wasm, this keeps render pipelines from compiling in the background. Otherwise, this
+    /// has no effect on macOS or without the `multi_threaded` feature.
     pub(crate) synchronous_pipeline_compilation: bool,
     /// If `true`, the shader cache needs to be repopulated from the main world's `Assets<Shader>`.
     needs_shader_reload: bool,
@@ -383,10 +384,27 @@ impl PipelineCache {
     }
 
     /// Wait for a render pipeline to finish compiling.
+    ///
+    /// On wasm, where nothing can be waited for, a render pipeline still compiling in the
+    /// background is created again within this call instead.
     #[inline]
     pub fn block_on_render_pipeline(&mut self, id: CachedRenderPipelineId) {
         if self.pipelines.len() <= id.id() {
             self.process_queue();
+        }
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let cached = &self.pipelines[id.id()];
+            if let (
+                CachedPipelineState::Creating(_),
+                PipelineDescriptor::RenderPipelineDescriptor(descriptor),
+            ) = (&cached.state, &cached.descriptor)
+            {
+                let descriptor = *descriptor.clone();
+                self.pipelines[id.id()].state =
+                    self.start_create_render_pipeline(id.id(), descriptor, Creation::Blocking);
+            }
         }
 
         let state = &mut self.pipelines[id.id()].state;
@@ -533,10 +551,20 @@ impl PipelineCache {
         }
     }
 
+    /// How a pipeline the queue reaches is created ([`Creation::of`]).
+    fn creation(&self, render: bool) -> Creation {
+        Creation::of(
+            self.synchronous_pipeline_compilation,
+            cfg!(target_arch = "wasm32"),
+            render,
+        )
+    }
+
     fn start_create_render_pipeline(
         &mut self,
         id: CachedPipelineId,
         descriptor: RenderPipelineDescriptor,
+        creation: Creation,
     ) -> CachedPipelineState {
         let device = self.device.clone();
         let shader_cache = self.shader_cache.clone();
@@ -552,35 +580,42 @@ impl PipelineCache {
 
         create_pipeline_task(
             async move {
-                let mut shader_cache = shader_cache.lock().unwrap();
-                let mut layout_cache = layout_cache.lock().unwrap();
+                let (vertex_module, fragment_module, layout) = {
+                    let mut shader_cache = shader_cache.lock().unwrap();
+                    let mut layout_cache = layout_cache.lock().unwrap();
 
-                let vertex_module = match shader_cache.get(
-                    id,
-                    descriptor.vertex.shader.id(),
-                    &descriptor.vertex.shader_defs,
-                ) {
-                    Ok(module) => module,
-                    Err(err) => return Err(err),
-                };
+                    let vertex_module = match shader_cache.get(
+                        id,
+                        descriptor.vertex.shader.id(),
+                        &descriptor.vertex.shader_defs,
+                    ) {
+                        Ok(module) => module,
+                        Err(err) => return Err(err),
+                    };
 
-                let fragment_module = match &descriptor.fragment {
-                    Some(fragment) => {
-                        match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs) {
-                            Ok(module) => Some(module),
-                            Err(err) => return Err(err),
+                    let fragment_module = match &descriptor.fragment {
+                        Some(fragment) => {
+                            match shader_cache.get(id, fragment.shader.id(), &fragment.shader_defs)
+                            {
+                                Ok(module) => Some(module),
+                                Err(err) => return Err(err),
+                            }
                         }
-                    }
-                    None => None,
-                };
+                        None => None,
+                    };
 
-                let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
-                    None
-                } else {
-                    Some(layout_cache.get(&device, &bind_group_layout, descriptor.immediate_size))
-                };
+                    let layout = if descriptor.layout.is_empty() && descriptor.immediate_size == 0 {
+                        None
+                    } else {
+                        Some(layout_cache.get(
+                            &device,
+                            &bind_group_layout,
+                            descriptor.immediate_size,
+                        ))
+                    };
 
-                drop((shader_cache, layout_cache));
+                    (vertex_module, fragment_module, layout)
+                };
 
                 let vertex_buffer_layouts = descriptor
                     .vertex
@@ -647,11 +682,20 @@ impl PipelineCache {
                     cache: None,
                 };
 
+                #[cfg(target_arch = "wasm32")]
+                if creation == Creation::Task {
+                    let pending = device.create_render_pipeline_async(&descriptor);
+                    return pending
+                        .await
+                        .map(Pipeline::RenderPipeline)
+                        .map_err(|error| ShaderCacheError::CreatePipeline(error.to_string()));
+                }
+
                 Ok(Pipeline::RenderPipeline(
                     device.create_render_pipeline(&descriptor),
                 ))
             },
-            self.synchronous_pipeline_compilation,
+            creation,
         )
     }
 
@@ -713,7 +757,7 @@ impl PipelineCache {
                     device.create_compute_pipeline(&descriptor),
                 ))
             },
-            self.synchronous_pipeline_compilation,
+            self.creation(false),
         )
     }
 
@@ -851,7 +895,7 @@ impl PipelineCache {
                     device.create_mesh_pipeline(&descriptor),
                 ))
             },
-            self.synchronous_pipeline_compilation,
+            self.creation(false),
         )
     }
     /// Process the pipeline queue and create all pending pipelines if possible.
@@ -887,9 +931,8 @@ impl PipelineCache {
         match &mut cached_pipeline.state {
             CachedPipelineState::Queued => {
                 cached_pipeline.state = match &cached_pipeline.descriptor {
-                    PipelineDescriptor::RenderPipelineDescriptor(descriptor) => {
-                        self.start_create_render_pipeline(id, *descriptor.clone())
-                    }
+                    PipelineDescriptor::RenderPipelineDescriptor(descriptor) => self
+                        .start_create_render_pipeline(id, *descriptor.clone(), self.creation(true)),
                     PipelineDescriptor::ComputePipelineDescriptor(descriptor) => {
                         self.start_create_compute_pipeline(id, *descriptor.clone())
                     }
@@ -929,6 +972,10 @@ impl PipelineCache {
                 }
                 ShaderCacheError::CreateShaderModule(description) => {
                     error!("failed to create shader module: {}", description);
+                    return;
+                }
+                ShaderCacheError::CreatePipeline(description) => {
+                    error!("failed to create pipeline: {}", description);
                     return;
                 }
             },
@@ -1055,16 +1102,40 @@ fn pipeline_error_context(cached_pipeline: &CachedPipeline) -> String {
     }
 }
 
-#[cfg(all(
-    not(target_arch = "wasm32"),
-    not(target_os = "macos"),
-    feature = "multi_threaded"
+/// How [`PipelineCache`] creates a pipeline it starts creating.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Creation {
+    /// Within the call that starts it, so that it is made when that returns.
+    Blocking,
+    /// As a task the cache checks on each frame: on the async compute task pool, where there
+    /// are threads, and on the web, through the device's asynchronous pipeline creation,
+    /// which compiles a render pipeline's shaders in the background.
+    Task,
+}
+
+impl Creation {
+    /// How a pipeline is created when the cache is asked for `synchronous` compilation or
+    /// not, on the `web` or not, and the pipeline is a `render` pipeline or not: on the web,
+    /// only a render pipeline is created as a task, since only render pipelines compile in
+    /// the background there.
+    fn of(synchronous: bool, web: bool, render: bool) -> Self {
+        if synchronous || (web && !render) {
+            Self::Blocking
+        } else {
+            Self::Task
+        }
+    }
+}
+
+#[cfg(any(
+    target_arch = "wasm32",
+    all(not(target_os = "macos"), feature = "multi_threaded")
 ))]
 fn create_pipeline_task(
     task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    sync: bool,
+    creation: Creation,
 ) -> CachedPipelineState {
-    if !sync {
+    if creation == Creation::Task {
         return CachedPipelineState::Creating(bevy_tasks::AsyncComputeTaskPool::get().spawn(task));
     }
 
@@ -1074,17 +1145,42 @@ fn create_pipeline_task(
     }
 }
 
-#[cfg(any(
-    target_arch = "wasm32",
-    target_os = "macos",
-    not(feature = "multi_threaded")
+#[cfg(all(
+    not(target_arch = "wasm32"),
+    any(target_os = "macos", not(feature = "multi_threaded"))
 ))]
 fn create_pipeline_task(
     task: impl Future<Output = Result<Pipeline, ShaderCacheError>> + Send + 'static,
-    _sync: bool,
+    _creation: Creation,
 ) -> CachedPipelineState {
     match bevy_tasks::block_on(task) {
         Ok(pipeline) => CachedPipelineState::Ok(pipeline),
         Err(err) => CachedPipelineState::Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Creation;
+
+    #[test]
+    fn synchronous_compilation_creates_every_pipeline_within_the_call() {
+        for web in [false, true] {
+            for render in [false, true] {
+                assert_eq!(Creation::of(true, web, render), Creation::Blocking);
+            }
+        }
+    }
+
+    #[test]
+    fn off_the_web_every_pipeline_is_created_as_a_task() {
+        assert_eq!(Creation::of(false, false, true), Creation::Task);
+        assert_eq!(Creation::of(false, false, false), Creation::Task);
+    }
+
+    #[test]
+    fn on_the_web_only_a_render_pipeline_is_created_as_a_task() {
+        assert_eq!(Creation::of(false, true, true), Creation::Task);
+        assert_eq!(Creation::of(false, true, false), Creation::Blocking);
     }
 }

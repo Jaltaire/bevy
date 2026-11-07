@@ -5812,3 +5812,15 @@ bevy_pbr = { path = "crates/bevy_pbr" }
 bevy_core_pipeline = { path = "crates/bevy_core_pipeline" }
 bevy_sprite_render = { path = "crates/bevy_sprite_render" }
 bevy_ui_render = { path = "crates/bevy_ui_render" }
+
+[patch.crates-io]
+naga = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-core = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-core-deps-apple = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-core-deps-emscripten = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-core-deps-wasm = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-hal = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-naga-bridge = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
+wgpu-types = { git = "https://github.com/Jaltaire/wgpu", branch = "main-jaltaire" }
